@@ -4,6 +4,8 @@ Unit tests for AISBatchLoader.
 These tests use mocking to simulate AIStore client behavior,
 allowing them to run in CI environments without AIStore infrastructure.
 """
+import json
+import os
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -15,6 +17,7 @@ from lhotse.ais.batch_loader import (
     FILE_TO_MEMORY_TYPE,
     AISBatchLoader,
     AISBatchLoaderError,
+    aggregate_metrics,
 )
 from lhotse.array import Array, TemporalArray
 from lhotse.audio import AudioSource, Recording
@@ -769,3 +772,622 @@ class TestAISBatchLoaderIntegration:
 
         # No URLs should be added for invalid feature paths
         assert batch.add.call_count == 0
+
+
+class TestAISBatchLoaderVersionCompatibility:
+    """Tests for backward compatibility with older AIStore versions."""
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_colocation_not_available_fallback(
+        self, mock_get_client, cut_with_url_recording
+    ):
+        """Test that batch creation works when Colocation is not available (older versions)."""
+        client = MagicMock()
+        batch = MagicMock()
+
+        # Track add() calls
+        add_count = []
+        batch.add.side_effect = lambda *args, **kwargs: add_count.append(1)
+
+        # Mock batch.get() to return content
+        def mock_batch_get():
+            for i in range(len(add_count)):
+                yield (MagicMock(), f"content_{i}".encode())
+
+        batch.get.side_effect = lambda: mock_batch_get()
+
+        # Mock client.batch() to raise TypeError when colocation is passed (older version)
+        def mock_batch_with_error(**kwargs):
+            if "colocation" in kwargs:
+                raise TypeError(
+                    "batch() got an unexpected keyword argument 'colocation'"
+                )
+            return batch
+
+        client.batch.side_effect = mock_batch_with_error
+        client.bucket.return_value = MagicMock()
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader()
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        result = loader(cuts)
+
+        # Verify batch was called twice: once with colocation (failed), once without
+        assert client.batch.call_count == 2
+
+        # Verify processing succeeded
+        for cut in result:
+            assert cut.recording.sources[0].type == "memory"
+
+
+class TestAISBatchLoaderErrorHandling:
+    """Tests for error handling and fallback mechanisms."""
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_batch_get_failure_triggers_fallback(
+        self, mock_get_client, cut_with_url_recording
+    ):
+        """Test that batch.get() failure triggers sequential GET fallback."""
+        from aistore.sdk.errors import AISError
+
+        client = MagicMock()
+        batch = MagicMock()
+
+        # Track add() calls
+        add_count = []
+        batch.add.side_effect = lambda *args, **kwargs: add_count.append(1)
+
+        # Mock batch.get() to raise AISError (use Exception as base since AISError has complex init)
+        batch.get.side_effect = AISError(
+            400, "Batch request failed", "http://test", MagicMock()
+        )
+
+        # Mock batch.requests_list for fallback
+        mock_request = MagicMock()
+        mock_request.object_name = "audio.wav"
+        mock_request.bucket_name = "mybucket"
+        mock_request.provider = "ais"
+        mock_request.archpath = None
+        batch.requests_list = [mock_request]
+
+        # Mock sequential GET fallback
+        mock_reader = MagicMock()
+        mock_reader.read_all.return_value = b"fallback_content"
+        mock_object = MagicMock()
+        mock_object.get_reader.return_value = mock_reader
+        mock_bucket = MagicMock()
+        mock_bucket.object.return_value = mock_object
+        client.bucket.return_value = mock_bucket
+
+        client.batch.return_value = batch
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader()
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        result = loader(cuts)
+
+        # Verify batch.get() was called and failed
+        assert batch.get.called
+
+        # Verify fallback was used (bucket.object was called)
+        assert client.bucket.called
+        assert mock_bucket.object.called
+        assert mock_reader.read_all.called
+
+        # Verify the recording was updated with fallback content
+        for cut in result:
+            assert cut.recording.sources[0].type == "memory"
+            assert cut.recording.sources[0].source == b"fallback_content"
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_fallback_with_archive_path(self, mock_get_client, cut_with_url_recording):
+        """Test that fallback handles archive paths correctly."""
+        from aistore.sdk.errors import AISError
+
+        client = MagicMock()
+        batch = MagicMock()
+
+        # Track add() calls
+        add_count = []
+        batch.add.side_effect = lambda *args, **kwargs: add_count.append(1)
+
+        # Mock batch.get() to raise AISError
+        batch.get.side_effect = AISError(
+            400, "Batch request failed", "http://test", MagicMock()
+        )
+
+        # Mock batch.requests_list with archpath
+        mock_request = MagicMock()
+        mock_request.object_name = "archive.tar.gz"
+        mock_request.bucket_name = "mybucket"
+        mock_request.provider = "ais"
+        mock_request.archpath = "audio.wav"  # File inside archive
+        batch.requests_list = [mock_request]
+
+        # Mock sequential GET fallback with archive config
+        mock_reader = MagicMock()
+        mock_reader.read_all.return_value = b"archive_content"
+        mock_object = MagicMock()
+        mock_object.get_reader.return_value = mock_reader
+        mock_bucket = MagicMock()
+        mock_bucket.object.return_value = mock_object
+        client.bucket.return_value = mock_bucket
+
+        client.batch.return_value = batch
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader()
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        result = loader(cuts)
+
+        # Verify get_reader was called with archive_config
+        call_kwargs = mock_object.get_reader.call_args[1]
+        assert "archive_config" in call_kwargs
+        assert call_kwargs["archive_config"] is not None
+
+        # Verify the recording was updated
+        for cut in result:
+            assert cut.recording.sources[0].type == "memory"
+            assert cut.recording.sources[0].source == b"archive_content"
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_fallback_failure_raises_error(
+        self, mock_get_client, cut_with_url_recording
+    ):
+        """Test that fallback failure raises AISBatchLoaderError."""
+        from aistore.sdk.errors import AISError
+
+        client = MagicMock()
+        batch = MagicMock()
+
+        # Mock batch.get() to raise AISError
+        batch.get.side_effect = AISError(
+            400, "Batch request failed", "http://test", MagicMock()
+        )
+
+        # Mock batch.requests_list
+        mock_request = MagicMock()
+        mock_request.object_name = "audio.wav"
+        mock_request.bucket_name = "mybucket"
+        mock_request.provider = "ais"
+        mock_request.archpath = None
+        batch.requests_list = [mock_request]
+
+        # Mock sequential GET to also fail
+        mock_object = MagicMock()
+        mock_object.get_reader.side_effect = Exception("Sequential GET failed")
+        mock_bucket = MagicMock()
+        mock_bucket.object.return_value = mock_object
+        client.bucket.return_value = mock_bucket
+
+        client.batch.return_value = batch
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader()
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+
+        # Should raise AISBatchLoaderError when fallback fails
+        with pytest.raises(AISBatchLoaderError, match="Sequential GET fallback failed"):
+            loader(cuts)
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_iterator_exhausted_raises_error(
+        self, mock_get_client, cut_with_url_recording
+    ):
+        """Test that iterator exhaustion raises AISBatchLoaderError."""
+        client = MagicMock()
+        batch = MagicMock()
+
+        # Track add() calls
+        add_count = []
+        batch.add.side_effect = lambda *args, **kwargs: add_count.append(1)
+
+        # Mock batch.get() to return fewer items than expected
+        def mock_batch_get():
+            # Return nothing even though we expect 1 item
+            return iter([])
+
+        batch.get.side_effect = lambda: mock_batch_get()
+        client.batch.return_value = batch
+        client.bucket.return_value = MagicMock()
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader()
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+
+        # Should raise AISBatchLoaderError when iterator is exhausted
+        with pytest.raises(
+            AISBatchLoaderError, match="Batch result iterator exhausted prematurely"
+        ):
+            loader(cuts)
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_multiple_cuts_with_fallback(self, mock_get_client, cut_with_url_recording):
+        """Test fallback with multiple cuts."""
+        from aistore.sdk.errors import AISError
+
+        client = MagicMock()
+        batch = MagicMock()
+
+        # Track add() calls
+        add_count = []
+        batch.add.side_effect = lambda *args, **kwargs: add_count.append(1)
+
+        # Mock batch.get() to raise AISError
+        batch.get.side_effect = AISError(
+            400, "Batch request failed", "http://test", MagicMock()
+        )
+
+        # Mock batch.requests_list with 2 requests
+        mock_request1 = MagicMock()
+        mock_request1.object_name = "audio1.wav"
+        mock_request1.bucket_name = "mybucket"
+        mock_request1.provider = "ais"
+        mock_request1.archpath = None
+
+        mock_request2 = MagicMock()
+        mock_request2.object_name = "audio2.wav"
+        mock_request2.bucket_name = "mybucket"
+        mock_request2.provider = "ais"
+        mock_request2.archpath = None
+
+        batch.requests_list = [mock_request1, mock_request2]
+
+        # Mock sequential GET fallback to return different content for each
+        call_count = [0]
+
+        def mock_get_reader(*args, **kwargs):
+            mock_reader = MagicMock()
+            content = f"content_{call_count[0]}".encode()
+            mock_reader.read_all.return_value = content
+            call_count[0] += 1
+            return mock_reader
+
+        mock_object = MagicMock()
+        mock_object.get_reader.side_effect = mock_get_reader
+        mock_bucket = MagicMock()
+        mock_bucket.object.return_value = mock_object
+        client.bucket.return_value = mock_bucket
+
+        client.batch.return_value = batch
+        mock_get_client.return_value = (client, None)
+
+        # Create 2 cuts
+        cut2 = MonoCut(
+            id="cut-2",
+            start=0.0,
+            duration=10.0,
+            channel=0,
+            recording=Recording(
+                id="rec-2",
+                sources=[
+                    AudioSource(
+                        type="url", channels=[0], source="ais://mybucket/audio2.wav"
+                    )
+                ],
+                sampling_rate=16000,
+                num_samples=160000,
+                duration=10.0,
+            ),
+        )
+
+        loader = AISBatchLoader()
+        cuts = CutSet.from_cuts([cut_with_url_recording, cut2])
+        result = loader(cuts)
+
+        # Verify both cuts were processed with fallback
+        result_list = list(result)
+        assert len(result_list) == 2
+        assert result_list[0].recording.sources[0].source == b"content_0"
+        assert result_list[1].recording.sources[0].source == b"content_1"
+
+
+class TestAISBatchLoaderMetrics:
+    """Tests for AISBatchLoader latency metrics collection."""
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_metrics_disabled_by_default(self, mock_get_client):
+        """Test that metrics collection is disabled by default."""
+        mock_get_client.return_value = (MagicMock(), None)
+        loader = AISBatchLoader()
+        assert loader.collect_metrics is False
+        assert loader._latency_records is None
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_metrics_enabled_via_env_var(self, mock_get_client, tmp_path, monkeypatch):
+        """Test that LHOTSE_METRICS_DIR env var auto-enables metrics."""
+        monkeypatch.setenv("LHOTSE_METRICS_DIR", str(tmp_path))
+        mock_get_client.return_value = (MagicMock(), None)
+        loader = AISBatchLoader()
+        assert loader.collect_metrics is True
+        assert loader._latency_records == []
+        assert loader._metrics_dir == str(tmp_path)
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_metrics_enabled_via_constructor(self, mock_get_client):
+        """Test that collect_metrics=True enables metrics."""
+        mock_get_client.return_value = (MagicMock(), None)
+        loader = AISBatchLoader(collect_metrics=True)
+        assert loader.collect_metrics is True
+        assert loader._latency_records == []
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_get_metrics_raises_when_disabled(self, mock_get_client):
+        """Test that get_metrics() raises when metrics are disabled."""
+        mock_get_client.return_value = (MagicMock(), None)
+        loader = AISBatchLoader()
+        with pytest.raises(RuntimeError, match="Metrics collection is not enabled"):
+            loader.get_metrics()
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_get_metrics_raises_when_no_data(self, mock_get_client):
+        """Test that get_metrics() raises when no data has been collected."""
+        mock_get_client.return_value = (MagicMock(), None)
+        loader = AISBatchLoader(collect_metrics=True)
+        with pytest.raises(RuntimeError, match="No metrics data collected yet"):
+            loader.get_metrics()
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_metrics_collected_after_call(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording
+    ):
+        """Test that calling the loader records latency data."""
+        client, batch = mock_aistore_client
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+
+        assert len(loader._latency_records) == 1
+        elapsed, num_objects = loader._latency_records[0]
+        assert elapsed > 0
+        assert num_objects == 1  # one URL recording
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_get_metrics_correct_structure(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording
+    ):
+        """Test that get_metrics() returns correct structure with float values."""
+        client, batch = mock_aistore_client
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+        loader(cuts)  # Call twice for meaningful stats
+
+        metrics = loader.get_metrics()
+
+        # Check top-level keys
+        assert "batch" in metrics
+        assert "per_object" in metrics
+        assert "num_batches" in metrics
+        assert "total_objects" in metrics
+
+        # Check stat keys and types
+        for key in ("batch", "per_object"):
+            assert "p95" in metrics[key]
+            assert "p99" in metrics[key]
+            assert "avg" in metrics[key]
+            assert isinstance(metrics[key]["p95"], float)
+            assert isinstance(metrics[key]["p99"], float)
+            assert isinstance(metrics[key]["avg"], float)
+
+        assert metrics["num_batches"] == 2
+        # First call converts 1 URL object; second call finds 0 (already memory)
+        assert metrics["total_objects"] == 1
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_reset_metrics(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording
+    ):
+        """Test that reset_metrics() clears collected data."""
+        client, batch = mock_aistore_client
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+        assert len(loader._latency_records) == 1
+
+        loader.reset_metrics()
+        assert loader._latency_records == []
+        assert loader.collect_metrics is True  # still enabled
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_save_metrics_writes_file(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording, tmp_path
+    ):
+        """Test that save_metrics() writes a JSON file with rank and pid."""
+        client, batch = mock_aistore_client
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+
+        loader.save_metrics(str(tmp_path), rank=3)
+
+        expected_file = tmp_path / f"rank_3_pid_{os.getpid()}.json"
+        assert expected_file.exists()
+
+        data = json.loads(expected_file.read_text())
+        assert data["rank"] == 3
+        assert data["pid"] == os.getpid()
+        assert "batch" in data
+        assert "per_object" in data
+        assert "num_batches" in data
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_save_metrics_atomic(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording, tmp_path
+    ):
+        """Test that save_metrics() uses atomic write (no leftover .tmp files)."""
+        client, batch = mock_aistore_client
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+
+        loader.save_metrics(str(tmp_path), rank=0)
+
+        # No .tmp files should remain
+        tmp_files = list(tmp_path.glob("*.tmp"))
+        assert len(tmp_files) == 0
+
+        # The final file should exist
+        json_files = list(tmp_path.glob("rank_*.json"))
+        assert len(json_files) == 1
+
+    def test_aggregate_metrics(self, tmp_path):
+        """Test aggregate_metrics() with multi-rank, multi-pid files."""
+        # Write metrics files for 2 ranks, 2 workers each
+        for rank in (0, 1):
+            for pid in (1000 + rank * 10, 1001 + rank * 10):
+                data = {
+                    "batch": {
+                        "p95": 0.5 + rank * 0.1,
+                        "p99": 0.6 + rank * 0.1,
+                        "avg": 0.4 + rank * 0.1,
+                    },
+                    "per_object": {
+                        "p95": 0.05 + rank * 0.01,
+                        "p99": 0.06 + rank * 0.01,
+                        "avg": 0.04 + rank * 0.01,
+                    },
+                    "num_batches": 10,
+                    "total_objects": 50,
+                    "rank": rank,
+                    "pid": pid,
+                }
+                filepath = tmp_path / f"rank_{rank}_pid_{pid}.json"
+                filepath.write_text(json.dumps(data))
+
+        result = aggregate_metrics(str(tmp_path))
+
+        assert "global" in result
+        assert "per_rank" in result
+
+        g = result["global"]
+        assert g["num_batches"] == 40  # 10 × 4 files
+        assert g["total_objects"] == 200  # 50 × 4 files
+        assert g["num_ranks"] == 2
+        assert g["num_workers"] == 4
+
+        # Check global stats are floats
+        assert isinstance(g["batch"]["p95"], float)
+        assert isinstance(g["batch"]["p99"], float)
+        assert isinstance(g["batch"]["avg"], float)
+        assert isinstance(g["per_object"]["avg"], float)
+
+    def test_aggregate_per_rank_breakdown(self, tmp_path):
+        """Test that aggregate_metrics() provides correct per-rank breakdown."""
+        # Rank 0: 1 worker, Rank 1: 2 workers
+        data_r0 = {
+            "batch": {"p95": 0.5, "p99": 0.6, "avg": 0.4},
+            "per_object": {"p95": 0.05, "p99": 0.06, "avg": 0.04},
+            "num_batches": 10,
+            "total_objects": 50,
+            "rank": 0,
+            "pid": 1000,
+        }
+        (tmp_path / "rank_0_pid_1000.json").write_text(json.dumps(data_r0))
+
+        data_r1_w1 = {
+            "batch": {"p95": 0.7, "p99": 0.8, "avg": 0.6},
+            "per_object": {"p95": 0.07, "p99": 0.08, "avg": 0.06},
+            "num_batches": 20,
+            "total_objects": 100,
+            "rank": 1,
+            "pid": 2000,
+        }
+        (tmp_path / "rank_1_pid_2000.json").write_text(json.dumps(data_r1_w1))
+
+        data_r1_w2 = {
+            "batch": {"p95": 0.9, "p99": 1.0, "avg": 0.8},
+            "per_object": {"p95": 0.09, "p99": 0.10, "avg": 0.08},
+            "num_batches": 15,
+            "total_objects": 75,
+            "rank": 1,
+            "pid": 2001,
+        }
+        (tmp_path / "rank_1_pid_2001.json").write_text(json.dumps(data_r1_w2))
+
+        result = aggregate_metrics(str(tmp_path))
+
+        # Rank 0: 1 worker
+        assert result["per_rank"][0]["num_workers"] == 1
+        assert result["per_rank"][0]["num_batches"] == 10
+        assert result["per_rank"][0]["total_objects"] == 50
+        assert result["per_rank"][0]["batch"]["avg"] == pytest.approx(0.4)
+
+        # Rank 1: 2 workers, stats averaged across workers
+        assert result["per_rank"][1]["num_workers"] == 2
+        assert result["per_rank"][1]["num_batches"] == 35  # 20 + 15
+        assert result["per_rank"][1]["total_objects"] == 175  # 100 + 75
+        assert result["per_rank"][1]["batch"]["avg"] == pytest.approx(
+            0.7
+        )  # mean(0.6, 0.8)
+        assert result["per_rank"][1]["batch"]["p95"] == pytest.approx(
+            0.8
+        )  # mean(0.7, 0.9)
+
+    def test_aggregate_metrics_empty_dir(self, tmp_path):
+        """Test that aggregate_metrics() raises when no files are found."""
+        with pytest.raises(FileNotFoundError, match="No metrics files found"):
+            aggregate_metrics(str(tmp_path))
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_periodic_save(
+        self,
+        mock_get_client,
+        mock_aistore_client,
+        cut_with_url_recording,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Test that metrics are auto-saved every save_interval batches."""
+        monkeypatch.setenv("LHOTSE_METRICS_DIR", str(tmp_path))
+        client, batch = mock_aistore_client
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader(metrics_save_interval=3)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+
+        # First 2 calls — no file yet
+        loader(cuts)
+        loader(cuts)
+        assert len(list(tmp_path.glob("rank_*.json"))) == 0
+
+        # 3rd call triggers periodic save
+        loader(cuts)
+        files = list(tmp_path.glob("rank_*.json"))
+        assert len(files) == 1
+
+        data = json.loads(files[0].read_text())
+        assert data["num_batches"] == 3
+
+    @patch("lhotse.ais.batch_loader.get_aistore_client")
+    def test_periodic_save_disabled_when_interval_zero(
+        self,
+        mock_get_client,
+        mock_aistore_client,
+        cut_with_url_recording,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Test that periodic saving is disabled when save_interval=0."""
+        monkeypatch.setenv("LHOTSE_METRICS_DIR", str(tmp_path))
+        client, batch = mock_aistore_client
+        mock_get_client.return_value = (client, None)
+
+        loader = AISBatchLoader(metrics_save_interval=0)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+
+        for _ in range(5):
+            loader(cuts)
+
+        # No periodic saves should have occurred
+        assert len(list(tmp_path.glob("rank_*.json"))) == 0
