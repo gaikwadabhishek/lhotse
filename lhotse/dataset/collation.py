@@ -1,3 +1,4 @@
+import time
 import warnings
 from concurrent.futures import Executor
 from functools import partial
@@ -151,6 +152,7 @@ def collate_audio(
     executor: Optional[Executor] = None,
     fault_tolerant: bool = False,
     recording_field: Optional[str] = None,
+    object_latencies: Optional[List[float]] = None,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, CutSet]
 ]:
@@ -202,6 +204,7 @@ def collate_audio(
         suppress_errors=fault_tolerant,
         recording_field=recording_field,
         filter_aux_iter=sample_counts,
+        object_latencies=object_latencies,
     )
 
     if len(audios[0].shape) == 1:
@@ -515,6 +518,7 @@ def read_audio_from_cuts(
     suppress_errors: bool = False,
     recording_field: Optional[str] = None,
     filter_aux_iter: Optional[Iterable] = None,
+    object_latencies: Optional[List[float]] = None,
 ) -> Union[Tuple[List[torch.Tensor], CutSet], Tuple[List[torch.Tensor], CutSet, List]]:
     """
     Loads audio data from an iterable of cuts.
@@ -540,20 +544,26 @@ def read_audio_from_cuts(
         filter_aux_iter = repeat([None])
         aux_requested = False
     map_fn = map if executor is None else executor.map
+    if object_latencies is not None:
+        read_fn = partial(
+            _timed_read_audio,
+            suppress_errors=suppress_errors,
+            recording_field=recording_field,
+            object_latencies=object_latencies,
+        )
+    else:
+        read_fn = partial(
+            _read_audio,
+            suppress_errors=suppress_errors,
+            recording_field=recording_field,
+        )
     audios = []
     ok_cuts = []
     aux_iter_out = []
     for idx, (cut, maybe_audio, aux_item) in enumerate(
         zip(
             cuts,
-            map_fn(
-                partial(
-                    _read_audio,
-                    suppress_errors=suppress_errors,
-                    recording_field=recording_field,
-                ),
-                cuts,
-            ),
+            map_fn(read_fn, cuts),
             filter_aux_iter,
         )
     ):
@@ -645,6 +655,26 @@ def _read_audio(
         if audio.shape[0] == 1:
             audio = audio.squeeze(0)  # collapse channel dim if mono
         return torch.from_numpy(audio)
+
+
+def _timed_read_audio(
+    cut: Cut,
+    suppress_errors: bool = False,
+    recording_field: Optional[str] = None,
+    object_latencies: Optional[List[float]] = None,
+) -> Optional[torch.Tensor]:
+    """Wrapper around _read_audio that records per-object latency.
+
+    ``object_latencies`` is a shared list appended to from worker threads.
+    In CPython, list.append() is GIL-protected and effectively atomic.
+    """
+    t_start = time.perf_counter()
+    result = _read_audio(
+        cut, suppress_errors=suppress_errors, recording_field=recording_field
+    )
+    if object_latencies is not None:
+        object_latencies.append(time.perf_counter() - t_start)
+    return result
 
 
 def _read_features(cut: Cut) -> torch.Tensor:
