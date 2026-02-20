@@ -761,3 +761,273 @@ class TestAudioSamplesObjectLoaderIntegration:
         strategy = AudioSamples(use_object_loader=True, object_loader_max_workers=8)
 
         assert strategy.ais_object_loader.max_workers == 8
+
+
+# ----------------------------- Metrics Tests -----------------------------
+
+
+class TestAISObjectLoaderMetrics:
+    """Tests for latency metrics collection."""
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_metrics_disabled_by_default(self, mock_get_client):
+        """Test that metrics collection is disabled by default."""
+        mock_get_client.return_value = (MagicMock(), None)
+
+        loader = AISObjectLoader()
+
+        assert loader.collect_metrics is False
+        assert loader._object_latencies is None
+        assert loader._batch_latencies is None
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_metrics_enabled_via_flag(self, mock_get_client):
+        """Test that metrics collection is enabled with collect_metrics=True."""
+        mock_get_client.return_value = (MagicMock(), None)
+
+        loader = AISObjectLoader(collect_metrics=True)
+
+        assert loader.collect_metrics is True
+        assert loader._object_latencies == []
+        assert loader._batch_latencies == []
+
+    @patch.dict("os.environ", {"LHOTSE_METRICS_DIR": "/tmp/test_metrics"})
+    @patch("lhotse.ais.object_loader.atexit")
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_metrics_enabled_via_env(self, mock_get_client, mock_atexit):
+        """Test that LHOTSE_METRICS_DIR auto-enables metrics."""
+        mock_get_client.return_value = (MagicMock(), None)
+
+        loader = AISObjectLoader()
+
+        assert loader.collect_metrics is True
+        assert loader._metrics_dir == "/tmp/test_metrics"
+        mock_atexit.register.assert_called_once()
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_get_metrics_raises_when_disabled(self, mock_get_client):
+        """Test that get_metrics raises when metrics are not enabled."""
+        mock_get_client.return_value = (MagicMock(), None)
+
+        loader = AISObjectLoader()
+
+        with pytest.raises(RuntimeError, match="Metrics collection is not enabled"):
+            loader.get_metrics()
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_get_metrics_raises_when_no_data(self, mock_get_client):
+        """Test that get_metrics raises when no data has been collected."""
+        mock_get_client.return_value = (MagicMock(), None)
+
+        loader = AISObjectLoader(collect_metrics=True)
+
+        with pytest.raises(RuntimeError, match="No metrics data collected yet"):
+            loader.get_metrics()
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_metrics_collected_on_call(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording
+    ):
+        """Test that calling the loader populates latency records."""
+        mock_get_client.return_value = (mock_aistore_client, None)
+
+        loader = AISObjectLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+
+        assert len(loader._object_latencies) == 1
+        assert loader._object_latencies[0] > 0
+        assert len(loader._batch_latencies) == 1
+        batch_time, num_objects = loader._batch_latencies[0]
+        assert batch_time > 0
+        assert num_objects == 1
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_metrics_multiple_batches(self, mock_get_client, mock_aistore_client):
+        """Test metrics accumulate across multiple calls."""
+        mock_get_client.return_value = (mock_aistore_client, None)
+
+        loader = AISObjectLoader(collect_metrics=True)
+
+        # Need fresh cuts each call since loader mutates manifests in-place
+        def make_cuts():
+            rec = Recording(
+                id="rec-1",
+                sources=[
+                    AudioSource(
+                        type="url",
+                        channels=[0],
+                        source="ais://mybucket/audio/file1.wav",
+                    )
+                ],
+                sampling_rate=16000,
+                num_samples=160000,
+                duration=10.0,
+            )
+            cut = MonoCut(
+                id="cut-1", start=0.0, duration=10.0, channel=0, recording=rec
+            )
+            return CutSet.from_cuts([cut])
+
+        loader(make_cuts())
+        loader(make_cuts())
+        loader(make_cuts())
+
+        assert len(loader._batch_latencies) == 3
+        # Each batch has 1 object
+        assert len(loader._object_latencies) == 3
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_get_metrics_structure(self, mock_get_client, mock_aistore_client):
+        """Test that get_metrics returns correct structure with all fields."""
+        mock_get_client.return_value = (mock_aistore_client, None)
+
+        loader = AISObjectLoader(collect_metrics=True)
+
+        def make_cuts():
+            rec = Recording(
+                id="rec-1",
+                sources=[
+                    AudioSource(
+                        type="url",
+                        channels=[0],
+                        source="ais://mybucket/audio/file1.wav",
+                    )
+                ],
+                sampling_rate=16000,
+                num_samples=160000,
+                duration=10.0,
+            )
+            cut = MonoCut(
+                id="cut-1", start=0.0, duration=10.0, channel=0, recording=rec
+            )
+            return CutSet.from_cuts([cut])
+
+        loader(make_cuts())
+        loader(make_cuts())
+
+        metrics = loader.get_metrics()
+
+        # Check per_object structure
+        assert "per_object" in metrics
+        for key in ("p50", "p95", "p99", "avg"):
+            assert key in metrics["per_object"]
+            assert isinstance(metrics["per_object"][key], float)
+            assert metrics["per_object"][key] > 0
+
+        # Check batch structure
+        assert "batch" in metrics
+        for key in ("p50", "p95", "p99", "avg", "per_object_avg"):
+            assert key in metrics["batch"]
+            assert isinstance(metrics["batch"][key], float)
+            assert metrics["batch"][key] > 0
+
+        assert metrics["num_batches"] == 2
+        assert metrics["total_objects"] == 2
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_get_metrics_concurrent(
+        self, mock_get_client, cut_with_url_recording, cut_with_features
+    ):
+        """Test metrics are collected correctly in concurrent mode."""
+        client = MagicMock()
+        mock_reader = MagicMock()
+        mock_reader.read_all.return_value = b"dummy"
+        mock_object = MagicMock()
+        mock_object.get_reader.return_value = mock_reader
+        mock_bucket = MagicMock()
+        mock_bucket.object.return_value = mock_object
+        client.bucket.return_value = mock_bucket
+        mock_get_client.return_value = (client, None)
+
+        loader = AISObjectLoader(max_workers=2, collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording, cut_with_features])
+        loader(cuts)
+
+        metrics = loader.get_metrics()
+
+        # 2 objects fetched (1 recording + 1 features)
+        assert metrics["total_objects"] == 2
+        assert metrics["num_batches"] == 1
+        assert len(loader._object_latencies) == 2
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_reset_metrics(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording
+    ):
+        """Test that reset_metrics clears all records."""
+        mock_get_client.return_value = (mock_aistore_client, None)
+
+        loader = AISObjectLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+
+        assert len(loader._object_latencies) == 1
+        assert len(loader._batch_latencies) == 1
+
+        loader.reset_metrics()
+
+        assert loader._object_latencies == []
+        assert loader._batch_latencies == []
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_save_metrics(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording, tmp_path
+    ):
+        """Test that save_metrics writes a JSON file."""
+        mock_get_client.return_value = (mock_aistore_client, None)
+
+        loader = AISObjectLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+
+        loader.save_metrics(str(tmp_path), rank=0)
+
+        import json
+
+        files = list(tmp_path.glob("rank_*.json"))
+        assert len(files) == 1
+
+        data = json.loads(files[0].read_text())
+        assert "per_object" in data
+        assert "batch" in data
+        assert data["rank"] == 0
+        assert "pid" in data
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_no_metrics_overhead_when_disabled(
+        self, mock_get_client, mock_aistore_client, cut_with_url_recording
+    ):
+        """Test that disabling metrics adds no overhead (no lists created)."""
+        mock_get_client.return_value = (mock_aistore_client, None)
+
+        loader = AISObjectLoader(collect_metrics=False)
+        cuts = CutSet.from_cuts([cut_with_url_recording])
+        loader(cuts)
+
+        assert loader._object_latencies is None
+        assert loader._batch_latencies is None
+
+    @patch("lhotse.ais.object_loader.get_aistore_client")
+    def test_metrics_no_url_cuts(self, mock_get_client):
+        """Test that metrics handle batches with no fetchable objects."""
+        mock_get_client.return_value = (MagicMock(), None)
+
+        recording = Recording(
+            id="rec-1",
+            sources=[AudioSource(type="file", channels=[0], source="/local/file.wav")],
+            sampling_rate=16000,
+            num_samples=160000,
+            duration=10.0,
+        )
+        cut = MonoCut(
+            id="cut-1", start=0.0, duration=10.0, channel=0, recording=recording
+        )
+
+        loader = AISObjectLoader(collect_metrics=True)
+        cuts = CutSet.from_cuts([cut])
+        loader(cuts)
+
+        # No URLs means early return — no batch or object latencies recorded
+        assert len(loader._object_latencies) == 0
+        assert len(loader._batch_latencies) == 0
