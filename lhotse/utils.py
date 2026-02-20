@@ -853,9 +853,11 @@ def rich_exception_info(fn):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            raise type(e)(
-                f"{e}\n[extra info] When calling: {fn.__qualname__}(args={args} kwargs={kwargs})"
-            )
+            extra = f"\n[extra info] When calling: {fn.__qualname__}(args={args} kwargs={kwargs})"
+            try:
+                raise type(e)(f"{e}{extra}") from e
+            except TypeError:
+                raise RuntimeError(f"{type(e).__name__}: {e}{extra}") from e
 
     return wrapper
 
