@@ -1,7 +1,12 @@
+import atexit
+import json
 import logging
+import os
+import time
 from concurrent.futures import Executor, ThreadPoolExecutor
 from functools import lru_cache
-from typing import Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import torch
 import torch.nn.functional as F
@@ -225,6 +230,8 @@ class AudioSamples(BatchIO):
         use_batch_loader: bool = False,
         use_object_loader: bool = False,
         object_loader_max_workers: int = 1,
+        collect_metrics: bool = False,
+        metrics_save_interval: int = 100,
     ) -> None:
         """
         AudioSamples constructor.
@@ -247,6 +254,11 @@ class AudioSamples(BatchIO):
             by ``object_loader_max_workers``. Requires the input CutSet to be eager (not lazy).
         :param object_loader_max_workers: Number of concurrent fetch threads for the object loader.
             Only used when ``use_object_loader=True``. Default is 1 (sequential).
+        :param collect_metrics: If True, collect per-object and per-batch latency
+            metrics. Also auto-enabled when LHOTSE_METRICS_DIR env var is set.
+        :param metrics_save_interval: When LHOTSE_METRICS_DIR is set, auto-save
+            metrics to disk every this many batches. Defaults to 100.
+            Set to 0 to disable periodic saving (atexit only).
         """
         if use_batch_loader and use_object_loader:
             raise ValueError(
@@ -269,6 +281,23 @@ class AudioSamples(BatchIO):
             self.ais_object_loader = AISObjectLoader(
                 max_workers=object_loader_max_workers
             )
+
+        # Metrics infrastructure
+        self._metrics_dir = os.environ.get("LHOTSE_METRICS_DIR")
+        if self._metrics_dir or collect_metrics:
+            self.collect_metrics = True
+            self._object_latencies: Optional[List[float]] = []
+            self._batch_latencies: Optional[List[Tuple[float, int]]] = []
+        else:
+            self.collect_metrics = False
+            self._object_latencies = None
+            self._batch_latencies = None
+
+        self._metrics_save_interval = metrics_save_interval
+        self._batch_count = 0
+
+        if self._metrics_dir and self.collect_metrics:
+            atexit.register(self._auto_save_metrics)
 
     def __call__(
         self, cuts: CutSet, recording_field: Optional[str] = None
@@ -293,12 +322,141 @@ class AudioSamples(BatchIO):
             cuts = self.ais_batch_loader(cuts)
         elif self.use_object_loader and self.ais_object_loader is not None:
             cuts = self.ais_object_loader(cuts)
-        return collate_audio(
+
+        if self.collect_metrics:
+            _t_batch_start = time.perf_counter()
+            _obj_count_before = len(self._object_latencies)
+
+        result = collate_audio(
             cuts,
             executor=_get_executor(self.num_workers, executor_type=self._executor_type),
             fault_tolerant=self.fault_tolerant,
             recording_field=recording_field,
+            object_latencies=self._object_latencies if self.collect_metrics else None,
         )
+
+        if self.collect_metrics:
+            batch_elapsed = time.perf_counter() - _t_batch_start
+            num_objects = len(self._object_latencies) - _obj_count_before
+            self._batch_latencies.append((batch_elapsed, num_objects))
+            self._batch_count += 1
+
+            if (
+                self._metrics_dir
+                and self._metrics_save_interval > 0
+                and self._batch_count % self._metrics_save_interval == 0
+            ):
+                try:
+                    self.save_metrics(self._metrics_dir)
+                except Exception as e:
+                    logging.warning(f"Failed to periodically save metrics: {e}")
+
+        return result
+
+    # ----------------------------- Metrics Methods -----------------------------
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Compute and return latency metrics from collected records.
+
+        Returns a dict with keys:
+        - ``per_object``: P50, P95, P99, avg latencies (seconds) for individual
+          audio read operations.
+        - ``batch``: P50, P95, P99, avg wall-clock latencies (seconds) per
+          __call__ invocation, plus per-object derived stats.
+        - ``num_batches``, ``total_objects``.
+
+        Raises:
+            RuntimeError: If metrics collection is not enabled or no data has
+                been collected yet.
+        """
+        if not self.collect_metrics:
+            raise RuntimeError(
+                "Metrics collection is not enabled. "
+                "Pass collect_metrics=True or set LHOTSE_METRICS_DIR."
+            )
+        if not self._object_latencies and not self._batch_latencies:
+            raise RuntimeError(
+                "No metrics data collected yet. Call the loader on a CutSet first."
+            )
+
+        import numpy as np
+
+        result: Dict[str, Any] = {}
+
+        if self._object_latencies:
+            obj_lat = np.array(self._object_latencies)
+            result["per_object"] = {
+                "p50": float(np.median(obj_lat)),
+                "p95": float(np.percentile(obj_lat, 95)),
+                "p99": float(np.percentile(obj_lat, 99)),
+                "avg": float(np.mean(obj_lat)),
+            }
+        else:
+            result["per_object"] = {"p50": 0.0, "p95": 0.0, "p99": 0.0, "avg": 0.0}
+
+        if self._batch_latencies:
+            batch_times = np.array([t for t, _ in self._batch_latencies])
+            batch_per_object = np.array(
+                [t / n if n > 0 else 0.0 for t, n in self._batch_latencies]
+            )
+            result["batch"] = {
+                "p50": float(np.median(batch_times)),
+                "p95": float(np.percentile(batch_times, 95)),
+                "p99": float(np.percentile(batch_times, 99)),
+                "avg": float(np.mean(batch_times)),
+                "per_object_avg": float(np.mean(batch_per_object)),
+            }
+        else:
+            result["batch"] = {
+                "p50": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "avg": 0.0,
+                "per_object_avg": 0.0,
+            }
+
+        result["num_batches"] = len(self._batch_latencies)
+        result["total_objects"] = len(self._object_latencies)
+
+        return result
+
+    def reset_metrics(self) -> None:
+        """Clear all collected latency records."""
+        if self.collect_metrics:
+            self._object_latencies = []
+            self._batch_latencies = []
+
+    def save_metrics(self, path: str, rank: Optional[int] = None) -> None:
+        """Save collected metrics to a JSON file.
+
+        Args:
+            path: Directory where the metrics file will be written.
+            rank: Distributed rank. Defaults to ``int(os.environ.get("RANK", 0))``.
+        """
+        if rank is None:
+            rank = int(os.environ.get("RANK", 0))
+
+        metrics = self.get_metrics()
+        metrics["rank"] = rank
+        metrics["pid"] = os.getpid()
+
+        out_dir = Path(path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"rank_{rank}_pid_{os.getpid()}.json"
+        final_path = out_dir / filename
+        tmp_path = out_dir / f".{filename}.tmp"
+
+        tmp_path.write_text(json.dumps(metrics, indent=2))
+        tmp_path.rename(final_path)
+
+    def _auto_save_metrics(self) -> None:
+        """Save metrics on process exit (registered via atexit)."""
+        try:
+            if self._object_latencies or self._batch_latencies:
+                self.save_metrics(self._metrics_dir)
+        except Exception as e:
+            logging.warning(f"Failed to auto-save metrics on exit: {e}")
 
     def supervision_intervals(self, cuts: CutSet) -> Dict[str, torch.Tensor]:
         """
