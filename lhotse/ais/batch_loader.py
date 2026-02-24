@@ -68,10 +68,12 @@ class AISBatchLoader:
         self._metrics_dir = os.environ.get("LHOTSE_METRICS_DIR")
         if self._metrics_dir or collect_metrics:
             self.collect_metrics = True
-            self._latency_records: Optional[List] = []
+            self._batch_latencies: Optional[List[float]] = []
+            self._per_object_latencies: Optional[List[float]] = []
         else:
             self.collect_metrics = False
-            self._latency_records = None
+            self._batch_latencies = None
+            self._per_object_latencies = None
 
         self._metrics_save_interval = metrics_save_interval
         self._batch_count = 0
@@ -193,7 +195,13 @@ class AISBatchLoader:
                 content = None
 
                 try:
+                    if self.collect_metrics:
+                        _t_obj_start = time.perf_counter()
                     info, content = next(batch_result)
+                    if self.collect_metrics:
+                        self._per_object_latencies.append(
+                            time.perf_counter() - _t_obj_start
+                        )
                 except StopIteration:
                     raise AISBatchLoaderError(
                         "Batch result iterator exhausted prematurely. "
@@ -236,8 +244,7 @@ class AISBatchLoader:
                 request_idx += 1
 
         if self.collect_metrics:
-            num_objects = sum(1 for _, has_url in manifest_list if has_url)
-            self._latency_records.append((time.perf_counter() - _t_start, num_objects))
+            self._batch_latencies.append(time.perf_counter() - _t_start)
             self._batch_count += 1
 
             # Periodically save metrics to disk so data survives worker termination
@@ -271,40 +278,42 @@ class AISBatchLoader:
                 "Metrics collection is not enabled. "
                 "Pass collect_metrics=True or set LHOTSE_METRICS_DIR."
             )
-        if not self._latency_records:
+        if not self._batch_latencies:
             raise RuntimeError(
                 "No metrics data collected yet. Call the loader on a CutSet first."
             )
 
         import numpy as np
 
-        batch_latencies = np.array([t for t, _ in self._latency_records])
-        per_object_latencies = np.array(
-            [t / n if n > 0 else 0.0 for t, n in self._latency_records]
+        batch_arr = np.array(self._batch_latencies)
+        obj_arr = (
+            np.array(self._per_object_latencies)
+            if self._per_object_latencies
+            else np.array([0.0])
         )
-        total_objects = sum(n for _, n in self._latency_records)
 
         return {
             "batch": {
-                "p50": float(np.median(batch_latencies)),
-                "p95": float(np.percentile(batch_latencies, 95)),
-                "p99": float(np.percentile(batch_latencies, 99)),
-                "avg": float(np.mean(batch_latencies)),
+                "p50": float(np.median(batch_arr)),
+                "p95": float(np.percentile(batch_arr, 95)),
+                "p99": float(np.percentile(batch_arr, 99)),
+                "avg": float(np.mean(batch_arr)),
             },
             "per_object": {
-                "p50": float(np.median(per_object_latencies)),
-                "p95": float(np.percentile(per_object_latencies, 95)),
-                "p99": float(np.percentile(per_object_latencies, 99)),
-                "avg": float(np.mean(per_object_latencies)),
+                "p50": float(np.median(obj_arr)),
+                "p95": float(np.percentile(obj_arr, 95)),
+                "p99": float(np.percentile(obj_arr, 99)),
+                "avg": float(np.mean(obj_arr)),
             },
-            "num_batches": len(self._latency_records),
-            "total_objects": total_objects,
+            "num_batches": len(self._batch_latencies),
+            "total_objects": len(self._per_object_latencies),
         }
 
     def reset_metrics(self) -> None:
         """Clear all collected latency records."""
         if self.collect_metrics:
-            self._latency_records = []
+            self._batch_latencies = []
+            self._per_object_latencies = []
 
     def save_metrics(self, path: str, rank: Optional[int] = None) -> None:
         """Save collected metrics to a JSON file.
@@ -333,7 +342,7 @@ class AISBatchLoader:
     def _auto_save_metrics(self) -> None:
         """Save metrics on process exit (registered via atexit)."""
         try:
-            if self._latency_records:
+            if self._batch_latencies:
                 self.save_metrics(self._metrics_dir)
         except Exception as e:
             logger.warning(f"Failed to auto-save metrics on exit: {e}")
